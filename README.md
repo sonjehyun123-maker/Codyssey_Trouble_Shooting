@@ -1,232 +1,227 @@
-# Codyssey_Trouble_Shooting
+# 📄 agent-leak-app 장애 진단 및 트러블슈팅 종합 보고서
 
-## B1-2
+## 0. 시스템 초기 설정 (Environment Variables)
 
----
-
-# 초기 설정
+장애 진단 및 모니터링을 수행하기 전, `agent-leak-app` 구동을 위해 적용된 초기 환경변수 설정입니다. 테스트 과정에서 각 장애 원인을 규명하기 위해 일부 리소스 제한(`MEMORY_LIMIT`, `CPU_MAX_OCCUPY`, `MULTI_THREAD_ENABLE`) 변수를 동적으로 조정하며 검증을 진행했습니다.
 
 ```bash
-# 1. 필수 환경변수 설정
-export AGENT_HOME=$(pwd)
-export AGENT_LOG_DIR="/var/log/agent-app"
+export AGENT_PORT=15034
 export AGENT_UPLOAD_DIR="$AGENT_HOME/upload_files"
 export AGENT_KEY_PATH="$AGENT_HOME/api_keys"
-export MEMORY_LIMIT=128 # 메모리 누수 실험용
-export CPU_MAX_OCCUPY=10 # CPU 사용량 제한 (최솟값 10)
-
-export MULTI_THREAD_ENABLE=1 # Deadlock 재현을 위해 활성화
-
-# 2. 필수 디렉토리 및 키 파일 생성
-mkdir -p $AGENT_UPLOAD_DIR
-mkdir -p $AGENT_KEY_PATH
-echo "agent_api_key_test" > $AGENT_KEY_PATH/secret.key
-
-# 3. 실행
-./agent-app-leak
+export AGENT_LOG_DIR="$AGENT_HOME/logs"
+export MEMORY_LIMIT=256
+export CPU_MAX_OCCUPY=50
+export MULTI_THREAD_ENABLE=0
 ```
 
 ---
 
-# [Bug] OOM Crash - 메모리 누수로 인한 에이전트 자가 종료 발생
+# 1. OOM (메모리 누수) 분석 보고서
 
-## 1. Description (현상 설명)
+## 1) 발생 현상
 
-- 현상: 에이전트 실행 후 약 15~20초 시점에서 프로세스가 아무런 에러 메시지 없이 갑자기 종료(Killed)되는 현상이 발생함.
-- 조건: `MEMORY_LIMIT` 환경변수가 128MB로 설정된 상태에서 에이전트 구동 시 발생.
+`agent-leak-app` 프로세스가 실행된 이후, 시스템 전체 장애(OS OOM Killer)로 이어지기 전에 프로세스가 갑작스럽게 강제 종료(`Killed`)되는 현상이 발생함.
+
+가용 메모리가 점차 고갈되면서 시스템 불안정성을 유발하는 징후가 관측됨.
 
 ---
 
-## 2. Evidence & Logs (증거 자료)
+## 2) 재현 경로 및 증거
 
-### 2.1 프로그램 실행 로그 (핵심 구간)
+### 재현 경로
 
-```bash
-2026-05-15 17:56:45,189 [INFO] [MemoryWorker] Current Heap: 100MB
-2026-05-15 17:56:48,211 [INFO] [MemoryWorker] Current Heap: 125MB
-2026-05-15 17:56:51,234 [INFO] [MemoryWorker] Current Heap: 150MB
+기본 환경변수(`MEMORY_LIMIT=256`) 상태에서 프로세스 구동 후 `monitor.sh` 및 내부 로그 모니터링 수행.
 
-# 설정해둔 MEMORY_LIMIT(128MB) 보다 현재 힙 메모리가 커짐
+### 측정 데이터 및 종료 로그
 
-2026-05-15 17:56:51,234 [CRITICAL] [MemoryGuard] Memory limit exceeded (150MB >= 128MB)
-2026-05-15 17:56:51,234 [CRITICAL] [MemoryGuard] Self-terminating process 1448 to prevent system instability.
+```text
+2026-06-25 13:25:24,534 [INFO] [MemoryWorker] Current Heap: 25MB
+2026-06-25 13:25:27,591 [INFO] [MemoryWorker] Current Heap: 50MB
+...
+2026-06-25 13:25:52,022 [INFO] [MemoryWorker] Current Heap: 250MB
+2026-06-25 13:25:55,078 [INFO] [MemoryWorker] Current Heap: 275MB
+2026-06-25 13:25:55,078 [CRITICAL] [MemoryGuard] Memory limit exceeded (275MB >= 256MB) / (Recommend Over 256MB)
+2026-06-25 13:25:55,078 [CRITICAL] [MemoryGuard] Self-terminating process 1889 to prevent system instability.
 
 >>> [SYSTEM] SELF-TERMINATED (Memory Limit Exceeded) <<<
-
 Killed
 ```
 
-### 2.2 monitor.sh 관제 데이터 (추론값)
+---
 
-- 점유율 상승 패턴:
-  - 3초 간격으로 메모리 사용량이 약 25MB씩 선형적으로 증가함.
-- 최종 관측:
-  - 종료 직전 메모리 점유량 약 150MB 기록.
+## 3) 근본 원인
+
+### 기술적 원인 분석
+
+`MemoryWorker`가 동작하면서 약 3초 간격으로 Heap 메모리를 25MB씩 일정하게 누적 상승시키는 전형적인 메모리 누수(Memory Leak) 로직이 존재함.
+
+### 종료 메커니즘
+
+애플리케이션 내부의 메모리 보호 정책인 `MemoryGuard`가 설정된 임계치(256MB)를 초과하는 순간을 감지하고, 시스템 붕괴를 막기 위해 해당 프로세스(PID: 1889)를 스스로 강제 종료(Self-Terminated)시킴.
 
 ---
 
-## 3. Root Cause Analysis (원인 분석)
+## 4) 조치 내용
 
-### 기술적 원인
+애플리케이션이 메모리 정리(임계치 도달 시 캐시 플러시) 로직을 안전하게 실행할 수 있는 최소한의 힙 공간을 확보하기 위해 환경변수를 조정함.
 
-- `MemoryWorker` 스레드 내에서 메모리 할당 후 해제되지 않는 메모리 누수(Memory Leak) 현상이 발생함.
-- 힙(Heap) 영역이 지속적으로 팽창하여 설정된 임계치에 도달함.
-
-### OS 및 애플리케이션 동작 원리
-
-- 시스템 전체의 메모리 고갈로 인한 OOM Killer 작동 및 OS 패닉을 방지하기 위해 앱 내부에 Fail-Safe 기구인 `MemoryGuard`가 구현되어 있음.
-- 애플리케이션 레벨에서 자가 진단을 통해 설정된 임계치를 초과하는 순간 프로세스를 안전하게 종료하여 시스템 안정성을 확보함.
-
----
-
-## 4. Workaround & Verification (조치 및 검증)
-
-### 4.1 조치 내용
-
-- 환경변수 `MEMORY_LIMIT`을 기존 128MB에서 300MB로 상향 조정하여 에이전트 가용 메모리 범위를 확장함.
+### 조치 명령어
 
 ```bash
 export MEMORY_LIMIT=300
-./agent-app-leak
 ```
 
-### 4.2 Before & After 비교 결과
+---
 
-| 항목 | 조치 전 (Before) | 조치 후 (After) |
-|---|---|---|
-| 환경변수 설정 | MEMORY_LIMIT=128 | MEMORY_LIMIT=300 |
-| 최대 가용 메모리 | 128 MB | 300 MB |
-| 생존 시간 | 약 15초 (150MB에서 종료) | 지속 실행 (안정화 확인) |
+## 5) 결과 확인 (Before & After)
+
+| 항목         | Before (기본 설정)                      | After (환경변수 변경 후)                |
+| ---------- | ----------------------------------- | -------------------------------- |
+| 설정 값       | MEMORY_LIMIT=256                    | MEMORY_LIMIT=300                 |
+| 초기 진단      | `[ WARNING: Recommend Over 256MB ]` | `[ MEMORY ] Limit: 300MB [ OK ]` |
+| 최대 Heap 도달 | 275MB (임계치 초과로 즉시 다운)               | 300MB (내부 관리 로직 진입점 도달)          |
+| 최종 결과      | Killed (프로세스 강제 종료)                 | MEMORY RECOVERED (캐시 정리 후 생존)    |
+
+### 조치 후 검증
+
+`MEMORY_LIMIT=300`으로 변경한 후에는 300MB에 도달했을 때 프로그램이 종료되지 않고, 내부 청소 로직(`Memory Usage Reached Limit. Starting cleanup...`)이 트리거되어 메모리가 25MB로 정상 회복(Recovered) 및 안정화되는 것을 확인함.
 
 ---
 
-# [Bug] CPU Latency - CPU 과점유로 인한 Watchdog 강제 종료
+# 2. CPU 과점유 분석 보고서
 
-## 1. Description (현상 설명)
+## 1) 발생 현상
 
-- 현상: 고부하 연산 작업(Intensive Computation) 시 CPU 점유율이 급증하며, 특정 임계치 도달 시 Watchdog에 의해 프로세스가 종료됨.
-- 조건: `CPU_MAX_OCCUPY` 환경변수가 10%로 설정된 상태에서 연산 수행 시 발생.
+특정 연산 구간에 진입하면서 시스템 전체 부하가 아닌, `agent-leak-app` 프로세스의 단독 CPU 사용률이 급격하게 치솟는 현상이 관측됨.
 
 ---
 
-## 2. Evidence & Logs (증거 자료)
+## 2) 재현 경로 및 증거
 
-### 2.1 프로그램 실행 로그 (핵심 구간)
+### 재현 경로
+
+`CPU_MAX_OCCUPY=30` (30% 제한) 설정 후 `top`, `ps` 관제 스크립트 실행 및 로그 확인.
+
+### 측정 데이터 및 관련 로그
+
+```text
+2026-06-25 13:28:00,306 [INFO] [CpuWorker] Current Load: 5.00%
+2026-06-25 13:28:03,426 [INFO] [CpuWorker] Current Load: 10.02%
+...
+2026-06-25 13:28:15,906 [INFO] [CpuWorker] Current Load: 29.33%
+2026-06-25 13:28:21,142 [INFO] [CpuWorker] Peak reached (30.00%). Starting cooldown...
+2026-06-25 13:28:22,149 [INFO] [CpuWorker] Current Load: 30.00%
+2026-06-25 13:28:25,270 [INFO] [CpuWorker] Current Load: 23.84%
+```
+
+---
+
+## 3) 근본 원인
+
+### 기술적 원인 분석
+
+`CpuWorker` 구동 후 작업 연산량이 늘어남에 따라 CPU 사용률이 약 3초 간격으로 우상향함.
+
+### 종료/제어 메커니즘
+
+본 종료 현상은 시스템 에러나 크래시가 아닌, 시스템 과부하를 방지하기 위해 설계된 과점유 방지 정책(`Watchdog`)이 정상 작동한 결과임. 설정된 최대 임계치에 도달하는 순간 연산을 일시적으로 제어(Throttling)하여 부하를 낮추는 cooldown 로직이 발동됨.
+
+---
+
+## 4) 조치 내용
+
+프로세스가 시스템 자원을 조금 더 유연하게 활용하여 연산 효율을 높일 수 있도록 CPU 점유 임계치 환경변수를 상향 조정함.
+
+### 조치 명령어
 
 ```bash
-2026-05-15 19:40:04,534 [INFO] [CpuWorker] Current Load: 9.29%
-2026-05-15 19:40:07,635 [INFO] [CpuWorker] Peak reached (10.00%). Starting cooldown...
-2026-05-15 19:40:07,635 [INFO] [CpuWorker] Current Load: 10.00%
-
-# 임계치(10%) 도달 시 Watchdog이 SIGTERM을 발생시켜 종료 유도
-# 환경에 따라 Peak 직후 종료
-
-2026-05-15 19:25:32 [CRITICAL] [Watchdog] Resource Policy Violation: CPU_MAX_OCCUPY exceeded.
-
-Terminated
+export CPU_MAX_OCCUPY=50
 ```
 
-### 2.2 시스템 도구(top) 출력 결과
+---
 
-- `top` 관제 시 `agent-app-leak` 프로세스가 연산 피크 시점에 `%CPU` 수치가 10.0~12.5%를 기록하는 것을 실시간 확인.
-- 부하 생성기(`gzip`) 가동 시 시스템 부하와 맞물려 임계치를 초과함.
+## 5) 결과 확인 (Before & After)
+
+| 항목          | Before (제한 강화)           | After (제한 완화)              |
+| ----------- | ------------------------ | -------------------------- |
+| 설정 값        | CPU_MAX_OCCUPY=30        | CPU_MAX_OCCUPY=50          |
+| 임계치 도달 시점   | 실행 후 약 21초 시점 (13:28:21) | 실행 후 약 24초 시점 (13:29:34)   |
+| 최대 Peak 제어율 | 30.00% 도달 후 Cooldown 적용  | 50.00% 도달 후 Cooldown 적용    |
+| 최종 결과       | 23.84%로 부하 하향 안정화        | 부하 제어 및 300MB 메모리 관리 연계 성공 |
+
+### 조치 후 검증
+
+임계치를 50%로 완화했을 때 프로세스가 크래시 없이 더 높은 자원을 활용하여 안정적으로 작업을 처리했으며, Peak(50%) 달성 이후에도 쿨다운 정책이 정상 작동하여 시스템이 안전하게 유지됨을 확인함.
 
 ---
 
-## 3. Root Cause Analysis (원인 분석)
+# 3. 교착상태 (Deadlock) 진단 보고서
 
-### 기술적 원인
+## 1) 발생 현상
 
-- 에이전트 내 `CpuWorker`가 복잡한 연산을 수행하며 순간적으로 CPU 자원을 과다 점유함.
-
-### OS 동작 원리
-
-- 에이전트 내부에 상주하는 `Watchdog` 스레드가 일정 주기마다 점유율을 체크함.
-- 설정된 정책 위반 시 시스템 전체 응답성 저하를 막기 위해 스스로에게 `SIGTERM` 시그널을 보내 종료하는 리소스 가딩 메커니즘이 작동함.
+프로세스가 종료되거나 에러를 뱉지 않고 메모리에 살아있으나(PID 존재), CPU 및 메모리의 자원 변화가 완전히 멈추고 로그 기록 또한 중단되는 영구적 무응답(Hung/Blocked) 상태가 발생함.
 
 ---
 
-## 4. Workaround & Verification (조치 및 검증)
+## 2) 재현 경로 및 증거
 
-### 4.1 조치 내용
+### 재현 경로
 
-- 환경변수 `CPU_MAX_OCCUPY`를 기존 10%에서 60%로 상향 조정하여 연산 자원 임계치를 확보함.
+병렬 처리 모드(`Concurrency: True`)를 활성화한 상태에서 다중 트랜잭션 프로세서 구동.
 
-```bash
-export CPU_MAX_OCCUPY=60
-./agent-app-leak
+### 마지막 로그 지점 증거
+
+(`ps -ef` 상 PID는 존재하나 정체된 시점)
+
+```text
+2026-06-25 13:31:36,844 [INFO] [Worker-Thread-1] Need resource [Socket_Pool_B] to finish job.
+2026-06-25 13:31:36,844 [INFO] [Worker-Thread-1] WAITING for [Socket_Pool_B]... (Status: BLOCKED)
+2026-06-25 13:31:36,844 [INFO] [Worker-Thread-2] Need resource [Shared_Memory_A] to write logs.
+2026-06-25 13:31:36,844 [INFO] [Worker-Thread-2] WAITING for [Shared_Memory_A]... (Status: BLOCKED)
 ```
 
-### 4.2 Before & After 비교 결과
-
-| 항목 | 조치 전 (Before) | 조치 후 (After) |
-|---|---|---|
-| 환경변수 설정 | CPU_MAX_OCCUPY=10 | CPU_MAX_OCCUPY=60 |
-| 임계치 초과 여부 | 발생 (10% 이상 점유 시) | 미발생 (정상 연산 수행) |
-
 ---
 
-# [Bug] Deadlock - 자원 순환 참조로 인한 스레드 교착 상태 발생
+## 3) 근본 원인
 
-## 1. Description (현상 설명)
+### 기술적 원인 분석 (교착상태 4대 조건 만족)
 
-- 현상: 에이전트 실행 중 특정 시점에서 로그 출력이 중단되며, 프로세스는 존재하나 어떤 작업도 처리하지 못하는 `Hang` 상태가 됨.
-- 조건: `MULTI_THREAD_ENABLE=1` 설정으로 병렬 처리 모드 가동 시 발생.
+* 상호 배제: Strict resource locking 활성화로 자원 독점 사용.
+* 점유 대기: Thread-1이 Memory_A를 가진 채 Pool_B를 대기하고, 반대로 Thread-2는 Pool_B를 가진 채 Memory_A를 대기함.
+* 비선점: 스레드가 서로의 자원을 강제로 회수할 수 없음.
+* 순환 대기(Circular Wait): 아래와 같이 두 개의 스레드가 상대방의 자원을 물고 늘어지는 닫힌 루프(Loop)를 형성함.
 
----
-
-## 2. Evidence & Logs (증거 자료)
-
-### 2.1 프로그램 실행 로그 (핵심 구간)
-
-```bash
-2026-05-15 19:24:26,607 [INFO] [AgentWorker][Worker-Thread-1] Need resource [Socket_Pool_B] to finish job.
-2026-05-15 19:24:26,607 [INFO] [AgentWorker][Worker-Thread-2] Need resource [Shared_Memory_A] to write logs.
-
-2026-05-15 19:24:26,608 [INFO] [AgentWorker][Worker-Thread-1] WAITING for [Socket_Pool_B]... (Status: BLOCKED)
-2026-05-15 19:24:26,608 [INFO] [AgentWorker][Worker-Thread-2] WAITING for [Shared_Memory_A]... (Status: BLOCKED)
-
-# 이후 로그 출력 무한 중단
+```text
+[Worker-Thread-1] (점유: Shared_Memory_A) ───대기(BLOCKED)───> [Socket_Pool_B]
+       ▲                                                             │
+       │                                                             ▼
+ [Shared_Memory_A] <───대기(BLOCKED)─── [Worker-Thread-2] (점유: Socket_Pool_B)
 ```
 
-### 2.2 시스템 도구 확인 결과
-
-- `ps -ef | grep agent-app-leak`
-  - 프로세스 PID가 여전히 존재하여 종료되지 않았음을 확인.
-- `top -H`
-  - CPU 점유율이 0% 근처에서 변화가 없으며 스레드들이 연산을 멈춘 상태임을 확인.
-
 ---
 
-## 3. Root Cause Analysis (원인 분석)
+## 4) 조치 내용
 
-### 기술적 원인
+자원 경합 및 교착상태 발생 가능성을 원천 차단하기 위해, 동시성 모드를 비활성화하고 싱글 스레드 기반의 순차적 스케줄링 제어 방식으로 변경함.
 
-- 순환 대기(Circular Wait) 발생.
-- `Worker-Thread-1`은 자원 A를 쥔 채 B를 요청하고,
-- `Worker-Thread-2`는 자원 B를 쥔 채 A를 요청하며 서로 무한 대기함.
-
-### 이론적 근거
-
-- 교착상태 4대 조건(상호배제, 점유대기, 비선점, 순환대기) 중 `순환 대기`가 충족되어 발생한 전형적인 Deadlock 이슈임.
-
----
-
-## 4. Workaround & Verification (조치 및 검증)
-
-### 4.1 조치 내용
-
-- 환경변수 `MULTI_THREAD_ENABLE`을 0으로 설정하여 순차 처리 모드로 변경, 자원 경합을 원천 차단함.
+### 조치 내용
 
 ```bash
 export MULTI_THREAD_ENABLE=0
-./agent-app-leak
+# Concurrency: False
 ```
 
-### 4.2 Before & After 비교 결과
+---
 
-| 항목 | 조치 전 (Before) | 조치 후 (After) |
-|---|---|---|
-| 멀티스레딩 설정 | ENABLED (1) | DISABLED (0) |
-| 장애 현상 | 스레드 간 교착(Deadlock) 발생 | 순차적 접근으로 충돌 방지 |
-| 최종 상태 | 무한 대기 (Hang) | 모든 작업 정상 종료 확인 |
+## 5) 결과 확인 (Before & After)
+
+| 항목       | Before (병렬 모드 / 데드락 발생)      | After (순차 모드 / 데드락 회피)               |
+| -------- | ---------------------------- | ------------------------------------ |
+| 설정 값     | MULTI_THREAD_ENABLE=1 (True) | MULTI_THREAD_ENABLE=0 (False)        |
+| 자원 점유 방식 | 스레드 1, 2가 자원을 동시 선점하려 경합     | 싱글 스레드 기반 스케줄러 제어 순차 실행              |
+| 동작 로그 패턴 | 상호 자원 대기로 인해 BLOCKED 발생      | Thread-B → Thread-C → Thread-A 순차 완료 |
+| 최종 결과    | 시스템 먹통 (무한 대기)               | All tasks completed (정상 종료 및 안정화)    |
+
+### 조치 후 검증
+
+`MULTI_THREAD_ENABLE=0` 설정 적용 후, 스케줄러가 개별 태스크들을 순차적으로 실행 및 자원 반납을 유도함에 따라 교착상태가 회피되었으며, 최종적으로 모든 작업이 에러 없이 안전하게 완수(`All tasks completed`)됨을 확인함.
