@@ -1,4 +1,4 @@
-# 📄 agent-leak-app 장애 진단 및 트러블슈팅 종합 보고서
+# agent-leak-app 장애 진단 및 트러블슈팅 종합 보고서
 
 ## 0. 시스템 초기 설정 (Environment Variables)
 
