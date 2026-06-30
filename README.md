@@ -25,9 +25,9 @@ export MULTI_THREAD_ENABLE=0
 
 | 장애 유형 | 재현 조건 | 원인 | 상태 |
 |---|---|---|---|
-| **OOM** | MEMORY_LIMIT=256MB | 메모리 누수 | ✅ 임시 해결 (300MB로 상향) |
-| **CPU 과점유** | CPU_MAX_OCCUPY=10% | 높은 Cooldown 빈도 | ✅ 임시 해결 (50%로 상향) |
-| **Deadlock** | MULTI_THREAD_ENABLE=1 | 순환 자원 대기 | ✅ 임시 해결 (단일 스레드) |
+| **OOM** | MEMORY_LIMIT=256MB | 메모리 누수 | 해결 방안 (300MB로 상향) |
+| **CPU 과점유** | CPU_MAX_OCCUPY=10% | 높은 Cooldown 빈도 | 해결 방안 (50%로 상향) |
+| **Deadlock** | MULTI_THREAD_ENABLE=1 | 순환 자원 대기 | 해결 방안 (단일 스레드) |
 
 ---
 
@@ -194,6 +194,11 @@ ps -p $PID -o %cpu
 
 `ps` 명령어의 `%cpu` 옵션을 사용하여 해당 프로세스의 CPU 사용률을 확인하였다.
 
+* %CPU : CPU 사용률
+* %MEM : 메모리 사용률
+* RSS : 실제 RAM 사용량
+* VSZ : 가상 메모리 크기
+
 - **%CPU** : 프로세스가 현재 사용하는 CPU 사용률(%)
 
 ---
@@ -286,7 +291,6 @@ Deadlock은 프로그램이 멈추지만 프로세스는 살아 있으므로 원
 따라서 세 가지 장애 중 OOM이 가장 위험한 장애라고 판단하였다.
 
 ### 예방 방법
-
 
 - 메모리를 할당한 후에는 사용이 끝나면 반드시 해제한다.
 - MemoryGuard와 같은 메모리 보호 정책을 적용하여 임계치를 초과하기 전에 대응한다.
