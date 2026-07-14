@@ -2,9 +2,9 @@
 
 ## 1. Description (현상 설명)
 
-`agent-leak-app` 프로세스 실행 중 `CpuWorker` 스레드가 시작되면서 CPU 사용률이 지속적으로 상승한다. 설정된 CPU 점유율 제한(`CPU_MAX_OCCUPY`)에 도달하면 내부 CPU 보호 기능이 동작하여 CPU 사용량을 자동으로 낮추는 Cooldown 기능이 실행된다. 
+`agent-leak-app` 프로세스 실행 중 `CpuWorker` 스레드가 시작되면서 CPU 사용률이 지속적으로 상승한다. 앱 자체의 CPU 보호 기능은 설정된 CPU 점유율 제한(`CPU_MAX_OCCUPY`)에 도달하면 Cooldown을 실행해 부하를 낮추지만, 이와 별도로 시스템 Watchdog는 부하가 50~55% 부근에 도달하면 즉시 프로세스를 강제 종료(SIGTERM)한다.
 
-낮은 CPU 제한(`CPU_MAX_OCCUPY=10%`)에서는 cooldown이 반복적으로 발생하여 작업 효율이 저하되는 반면, 높은 제한(`CPU_MAX_OCCUPY=50%`)에서는 cooldown 빈도가 낮아져 안정적인 작업 처리가 가능하다.
+높은 제한(`CPU_MAX_OCCUPY=90%`)에서는 앱 자체 cooldown이 발동하기 전에 부하가 Watchdog 강제종료 구간에 먼저 도달해 프로세스가 종료되는 반면, 낮은 제한(`CPU_MAX_OCCUPY=50%`)에서는 cooldown이 위험 구간 진입 전에 먼저 동작하여 프로세스가 안정적으로 유지된다.
 
 ---
 
@@ -14,39 +14,40 @@
 
 ```bash
 MEMORY_LIMIT=256          # 메모리 제한 (MB)
-CPU_MAX_OCCUPY=10         # Before: CPU 점유율 제한 (%)
+CPU_MAX_OCCUPY=90         # Before: CPU 점유율 제한 (%)
 CPU_MAX_OCCUPY=50         # After: CPU 점유율 제한 (%)
 MULTI_THREAD_ENABLE=0     # 다중스레드 비활성화
 ```
 
 ---
 
-### 2.2 Before 케이스 (CPU_MAX_OCCUPY=10%)
+### 2.2 Before 케이스 (CPU_MAX_OCCUPY=90%)
 
 #### [앱 내부 로그]
 
-CPU 부하가 빠르게 10% 임계치 도달 → Cooldown 반복 패턴:
+CPU 임계치인 50%가 넘어가자 프로그램 kill
 
 ```
-2026-06-30 13:22:32,317 [INFO] [CpuWorker] Started. Maximum CPU Limit: 10%
-2026-06-30 13:22:32,317 [INFO] [CpuWorker] Current Load: 5.00%
-2026-06-30 13:22:35,438 [INFO] [CpuWorker] Current Load: 5.26%
-2026-06-30 13:22:38,557 [INFO] [CpuWorker] Current Load: 9.18%
-2026-06-30 13:22:40,669 [INFO] [CpuWorker] Peak reached (10.00%). Starting cooldown...
-                       ↓ 임계치 도달 → Cooldown 시작
-2026-06-30 13:22:41,676 [INFO] [CpuWorker] Current Load: 10.00%
-2026-06-30 13:22:43,790 [INFO] [CpuWorker] Cooldown complete (5.00%). Resuming load increase...
-                       ↓ 부하 감소 후 재개
-2026-06-30 13:22:44,796 [INFO] [CpuWorker] Current Load: 5.00%
-2026-06-30 13:22:47,916 [INFO] [CpuWorker] Current Load: 9.28%
-2026-06-30 13:22:50,029 [INFO] [CpuWorker] Peak reached (10.00%). Starting cooldown...
-                       ↓ Cooldown 반복 (사이클 반복)
-2026-06-30 13:22:51,036 [INFO] [CpuWorker] Current Load: 10.00%
+2026-07-14 13:11:37,174 [INFO] [CpuWorker] Started. Maximum CPU Limit: 90%
+2026-07-14 13:11:37,174 [INFO] [CpuWorker] Current Load: 5.00%
+2026-07-14 13:11:40,293 [INFO] [CpuWorker] Current Load: 7.35%
+2026-07-14 13:11:43,412 [INFO] [CpuWorker] Current Load: 14.26%
+2026-07-14 13:11:46,532 [INFO] [CpuWorker] Current Load: 20.87%
+2026-07-14 13:11:49,652 [INFO] [CpuWorker] Current Load: 30.62%
+2026-07-14 13:11:52,770 [INFO] [CpuWorker] Current Load: 31.22%
+2026-07-14 13:11:55,890 [INFO] [CpuWorker] Current Load: 41.02%
+2026-07-14 13:11:59,010 [INFO] [CpuWorker] Current Load: 48.16%
+2026-07-14 13:12:02,131 [INFO] [CpuWorker] Current Load: 55.41%
+2026-07-14 13:12:02,233 [CRITICAL] [CpuWorker] CPU Threshold Violated! (55.410000000000004%).
+
+>>> [SYSTEM] WATCHDOG: INITIATING EMERGENCY ABORT (SIGTERM) <<<
+
+Terminated
 ```
 
 **패턴 분석:**
-- 임계치 도달 간격: ~8초마다 "Peak reached" 로그 반복
-- Cooldown 지속 시간: ~2초
+- 임계치 도달시 : kill
+- Cooldown 빈도 : 없음
 - 작업 효율: 낮음 (작업이 자주 중단됨)
 
 #### [모니터링 데이터 (monitor.sh)]
@@ -54,22 +55,21 @@ CPU 부하가 빠르게 10% 임계치 도달 → Cooldown 반복 패턴:
 시스템 레벨에서 관찰한 CPU 사용률:
 
 ```
-[2026-06-30 13:22:31] PID:2394 CPU:%cpu MEM:%mem RSS/VSZ:  2.2  0.0  2236   3152  <- 초기 시작
-[2026-06-30 13:22:34] PID:2394 CPU:%cpu MEM:%mem RSS/VSZ:  0.9  0.0  2236   3152
-[2026-06-30 13:22:37] PID:2394 CPU:%cpu MEM:%mem RSS/VSZ:  0.6  0.0  2236   3152
-[2026-06-30 13:22:40] PID:2394 CPU:%cpu MEM:%mem RSS/VSZ:  0.4  0.0  2236   3152
-[2026-06-30 13:22:43] PID:2394 CPU:%cpu MEM:%mem RSS/VSZ:  0.3  0.0  2236   3152
-[2026-06-30 13:22:46] PID:2394 CPU:%cpu MEM:%mem RSS/VSZ:  0.2  0.0  2236   3152  <- 제어 상태 유지
-[2026-06-30 13:22:49] PID:2394 CPU:%cpu MEM:%mem RSS/VSZ:  0.2  0.0  2236   3152
-[2026-06-30 13:22:52] PID:2394 CPU:%cpu MEM:%mem RSS/VSZ:  0.2  0.0  2236   3152
-[2026-06-30 13:22:55] PID:2394 CPU:%cpu MEM:%mem RSS/VSZ:  0.1  0.0  2236   3152
-[2026-06-30 13:22:58] PID:2394 CPU:%cpu MEM:%mem RSS/VSZ:  0.1  0.0  2236   3152
-[2026-06-30 13:23:01] PID:2394 CPU:%cpu MEM:%mem RSS/VSZ:  0.1  0.0  2236   3152
+[2026-07-14 13:11:35] PID:2273 CPU:%cpu MEM:%mem RSS/VSZ: 46.1  0.0  2236   3152
+[2026-07-14 13:11:38] PID:2273 CPU:%cpu MEM:%mem RSS/VSZ:  1.9  0.0  2236   3152
+[2026-07-14 13:11:41] PID:2273 CPU:%cpu MEM:%mem RSS/VSZ:  0.9  0.0  2236   3152
+[2026-07-14 13:11:44] PID:2273 CPU:%cpu MEM:%mem RSS/VSZ:  0.6  0.0  2236   3152
+[2026-07-14 13:11:47] PID:2273 CPU:%cpu MEM:%mem RSS/VSZ:  0.4  0.0  2236   3152
+[2026-07-14 13:11:50] PID:2273 CPU:%cpu MEM:%mem RSS/VSZ:  0.3  0.0  2236   3152
+[2026-07-14 13:11:53] PID:2273 CPU:%cpu MEM:%mem RSS/VSZ:  0.3  0.0  2236   3152
+[2026-07-14 13:11:56] PID:2273 CPU:%cpu MEM:%mem RSS/VSZ:  0.2  0.0  2236   3152
+[2026-07-14 13:11:59] PID:2273 CPU:%cpu MEM:%mem RSS/VSZ:  0.2  0.0  2236   3152
 ```
 
 **해석:**
-- Cooldown 메커니즘이 CPU를 0.1~0.4% 범위로 계속 제어
-- 높은 부하 상태(Peak 10%)는 로그에 보이지만 모니터 데이터는 낮은 값 → Cooldown이 자주 작동함
+- CPU_MAX_OCCUPY=90%로 설정되어 있어 앱 자체 cooldown은 90%가 되어야 발동
+- 하지만 실제 부하가 50~55%대에 도달한 순간 외부 Watchdog가 먼저 SIGTERM으로 강제 종료
+- 즉 앱의 자체 보호 로직(cooldown)이 발동하기도 전에 프로세스가 죽어버리는 상황
 
 ---
 
@@ -99,8 +99,8 @@ CPU 부하가 더 천천히 상승 → 50% 도달 후에도 비교적 안정적:
 ```
 
 **패턴 분석:**
-- 임계치 도달 간격: ~21초 (전 케이스 대비 2배 이상 길어짐)
-- Cooldown 빈도: 훨씬 적음 (대부분 부하 조절 상태)
+- 임계치 도달 간격: ~21초 (전 케이스 대비 생존)
+- Cooldown 빈도: 적음 (대부분 부하 조절 상태)
 - 작업 효율: 높음 (더 높은 CPU 할당으로 연속적 작업 가능)
 
 #### [모니터링 데이터 (monitor.sh)]
@@ -154,15 +154,17 @@ CPU 부하가 `CPU_MAX_OCCUPY` 환경변수로 설정된 임계치를 넘으면:
 4. **회복 대기**: 부하가 임계치 이하로 내려갈 때까지 대기
 5. **작업 재개**: 부하 충분히 낮아지면 다시 부하 증가
 
-### 3.3 낮은 제한(10%)의 문제점
+### 3.3 높은 제한(90%)의 문제점
 
-- **빈번한 중단**: 임계치가 낮아서 곧바로 임계치 도달
-- **처리량 저하**: 실제 연산 시간 < 제어 대기 시간
+- **cooldown 발동 지연**: 앱 자체 cooldown 임계치가 90%로 설정되어 있어, 실제 부하가 낮은 구간에서는 cooldown이 동작하지 않음
+- **Watchdog 선제 개입**: 부하가 50~55% 부근에 도달하면 시스템 Watchdog가 즉시 SIGTERM으로 프로세스를 강제 종료
+- **결과**: 앱의 자체 보호 로직이 발동할 기회조차 없이 프로세스가 종료됨
 
-### 3.4 높은 제한(50%)의 이점
+### 3.4 낮은 제한(50%)의 이점
 
-- **여유로운 작업**: 임계치 도달까지 시간 여유 확보
-- **Cooldown 빈도 감소**: 임계치 폭이 넓어서 자주 제어되지 않음
+- **선제적 cooldown 발동**: CPU_MAX_OCCUPY를 50%로 낮추면 위험 구간(50~55%) 진입 직전에 앱 자체 cooldown이 먼저 동작
+- **Watchdog 임계치 회피**: cooldown으로 부하가 낮아지므로 Watchdog의 강제종료 조건에 도달하지 않음
+- **작업 연속성 확보**: 프로세스가 종료되지 않고 cooldown-재개를 반복하며 안정적으로 실행됨
 
 ---
 
@@ -170,38 +172,38 @@ CPU 부하가 `CPU_MAX_OCCUPY` 환경변수로 설정된 임계치를 넘으면:
 
 ### 4.1 조치 내용
 
-프로세스가 시스템 자원을 더 유연하게 활용할 수 있도록 CPU 임계치를 상향 조정했다.
+앱 자체 cooldown이 Watchdog 강제종료 임계치보다 먼저 발동하도록 CPU 임계치를 하향 조정했다.
 
 ```bash
 # Before
-export CPU_MAX_OCCUPY=10
+export CPU_MAX_OCCUPY=90
 
 # After
 export CPU_MAX_OCCUPY=50
 ```
 
-**상향 조정 근거:**
-- Before: 10% 제한으로 Cooldown 반복 (비효율적)
-- After: 50% 제한으로 작업 연속성 확보 (효율적)
+**하향 조정 근거:**
+- Before(90%): cooldown 발동이 너무 늦어 Watchdog에 의해 강제 종료됨 (비정상 종료)
+- After(50%): cooldown이 위험 구간 진입 전에 발동하여 프로세스가 안정적으로 유지됨 (정상 실행)
 
 ### 4.2 Before & After 비교
 
-| 항목 | Before (CPU_MAX_OCCUPY=10%) | After (CPU_MAX_OCCUPY=50%) |
+| 항목 | Before (CPU_MAX_OCCUPY=90%) | After (CPU_MAX_OCCUPY=50%) |
 |---|---|---|
-| **임계치** | 10.00% | 50.00% |
-| **첫 Peak 도달 시간** | ~8초 | ~21초 |
-| **Cooldown 발생 빈도** | 매 8초마다 | 드물게 |
-| **부하 상승 속도** | 빠름 (5% → 10% 직진) | 느림 (5% → 50% 점진) |
-| **최대 부하 상태** | 10.00% (자주) | 50.00% (드물게) |
-| **작업 연속성** | 낮음 | 높음 |
-| **프로세스 상태** | ✅ 정상 (제어됨) | ✅ 정상 (덜 제어됨) |
+| **cooldown 임계치** | 90.00% (도달 전 강제종료됨) | 50.00% |
+| **강제종료/Peak 발생 시간** | ~25초 (Watchdog Kill) | ~21초 (Cooldown) |
+| **Cooldown 발생 빈도** | 없음 (cooldown 전에 kill) | 발생함 |
+| **부하 상승 속도** | 빠르게 55%대까지 상승 후 강제종료 | 완만하게 50%까지 상승 후 cooldown 반복 |
+| **최대 부하 상태** | 55% 부근에서 SIGTERM | 50% 부근에서 cooldown으로 제어 |
+| **작업 연속성** | 없음 (프로세스 종료) | 있음 |
+| **프로세스 상태** | 강제 종료 (SIGTERM) | 정상 (cooldown으로 제어됨) |
 
 ### 4.3 검증 결과
 
-- **Cooldown 빈도 감소**: ✅ 성공 (8초마다 → 21초 간격으로 확대)
-- **부하 제어 안정성**: ✅ 확인 (임계치 초과 후 안정적으로 내려옴)
-- **작업 효율 향상**: ✅ 증명 (더 높은 CPU 할당으로 연속적 작업 가능)
-- **시스템 영향**: ✅ 최소 (다른 프로세스 지연 없음)
+- **강제종료 방지**: 성공 (Watchdog Kill 발생 → Cooldown으로 정상 유지)
+- **부하 제어 안정성**: 확인 (cooldown이 위험 구간 진입 전에 선제적으로 동작)
+- **작업 연속성 확보**: 증명 (프로세스 종료 없이 cooldown-재개 반복)
+- **시스템 영향**: 최소 (다른 프로세스 지연 없음)
 
 ---
 
@@ -235,4 +237,4 @@ export CPU_MAX_OCCUPY=50
 
 **CPU 과점유를 제어하는 Watchdog 정책**이 정상 작동하고 있으며, `CPU_MAX_OCCUPY` 환경변수로 유연한 제어가 가능함을 확인했다. 
 
-**임계치 10%** → **임계치 50%**로 상향 조정함으로써 Cooldown 빈도를 줄이고 작업 효율을 향상시켰다. 다만 **장기적 개선**을 위해서는 `CpuWorker` 알고리즘을 최적화하고 Busy-Waiting을 제거하는 코드 수정이 권장된다.
+**임계치 90%** → **임계치 50%**로 하향 조정함으로써 Watchdog에 의한 강제 종료를 방지하고 프로세스 안정성을 확보했다. 다만 **장기적 개선**을 위해서는 `CpuWorker` 알고리즘을 최적화하고 Busy-Waiting을 제거하는 코드 수정이 권장된다.

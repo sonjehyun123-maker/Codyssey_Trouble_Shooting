@@ -8,6 +8,16 @@
 ---
 ## 기본 환경 세팅
 ```bash
+export AGENT_HOME=/Users/sonjehyun1231743/agent-app-leak
+
+mkdir -p upload_files
+mkdir -p api_keys
+mkdir -p logs
+
+echo "agent_api_key_test" > api_keys/secret.key
+```
+
+```bash
 export AGENT_PORT=15034
 export AGENT_UPLOAD_DIR=$AGENT_HOME/upload_files
 export AGENT_KEY_PATH=$AGENT_HOME/api_keys
@@ -26,7 +36,7 @@ export MULTI_THREAD_ENABLE=0
 | 장애 유형 | 재현 조건 | 원인 | 상태 |
 |---|---|---|---|
 | **OOM** | MEMORY_LIMIT=256MB | 메모리 누수 | 해결 방안 (300MB로 상향) |
-| **CPU 과점유** | CPU_MAX_OCCUPY=10% | 높은 Cooldown 빈도 | 해결 방안 (50%로 상향) |
+| **CPU 과점유** | CPU_MAX_OCCUPY=90% | 프로그램 내부 cpu제한 | 해결 방안 (50%로 하향) |
 | **Deadlock** | MULTI_THREAD_ENABLE=1 | 순환 자원 대기 | 해결 방안 (단일 스레드) |
 
 ---
@@ -72,19 +82,22 @@ MEMORY_LIMIT=256  →  MEMORY_LIMIT=300
 **문제:**
 ```
 CpuWorker 부하 증가
-5% → 10% (임계치 도달)
+5% → ... → 52%
 ↓
-Watchdog Cooldown 시작
+설정된 CPU_MAX_OCCUPY(90%) 환경에서
+프로그램 내부 CPU 임계치(약 50%) 초과
 ↓
-5%로 감소 후 재개
+Watchdog 비상 종료(SYSTEM WATCHDOG)
 ↓
-다시 10% 도달 → Cooldown (반복)
+SIGTERM 발생
+↓
+프로세스 종료(Terminated)
 ```
 
-**증거 (Before 케이스, CPU_MAX_OCCUPY=10%):**
-- 앱 로그: `Peak reached (10.00%). Starting cooldown...` (매 8초마다)
+**증거 (Before 케이스, CPU_MAX_OCCUPY=90%):**
+- 앱 로그: `2026-07-14 12:23:55 [CRITICAL] CPU Threshold Violated! (52.04%)` (약 25초 후 발생)
 - 모니터: CPU 0.1~0.4% (제어 상태 지속)
-- Cooldown 빈도: 자주 발생 (비효율)
+- Cooldown 빈도: 발생하지않고 바로 kill
 
 **증거 (After 케이스, CPU_MAX_OCCUPY=50%):**
 - 앱 로그: `Peak reached (50.00%)...` (약 21초 후 첫 발생)
@@ -93,15 +106,15 @@ Watchdog Cooldown 시작
 
 **조치:**
 ```bash
-CPU_MAX_OCCUPY=10  →  CPU_MAX_OCCUPY=50
+CPU_MAX_OCCUPY=90  →  CPU_MAX_OCCUPY=50
 ```
 
 **효과:**
-- Cooldown 반복 주기 8초 → 21초 이상 확대
-- 작업 연속성 향상
-- 시스템 안정성 유지
+- Watchdog에 의한 비상 종료가 발생하지 않음
+- CPU 사용량이 50%에 도달하면 Cooldown이 동작하여 부하를 낮춤
+- 프로세스가 종료되지 않고 계속 실행됨
 
-**결론:** CPU 제한을 높여 작업 여유 확보, 시스템 전체 영향 최소화
+**결론:** CPU_MAX_OCCUPY를 권장값인 50%로 설정하면 Watchdog가 비상 종료를 수행하지 않고, Cooldown을 통해 CPU 사용량을 제어하면서 프로세스를 계속 실행할 수 있었다.
 
 ---
 
@@ -168,7 +181,7 @@ MULTI_THREAD_ENABLE=1  →  MULTI_THREAD_ENABLE=0
 | 환경변수 | Before (장애 발생 상태) | After (임시 해결 상태) | 개선 효과 |
 |---|---|---|---|
 | **MEMORY_LIMIT** | 256MB | 300MB | 내부 정리 로직 시간 확보 |
-| **CPU_MAX_OCCUPY** | 10% | 50% | Cooldown 빈도 감소 |
+| **CPU_MAX_OCCUPY** | 90% | 50% | Watchdog 강제종료 방지 (Cooldown으로 정상 제어) |
 | **MULTI_THREAD_ENABLE** | 1 (True) | 0 (False) | 교착상태 회피 |
 
 ---
